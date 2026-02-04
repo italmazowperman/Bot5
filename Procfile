@@ -1,1 +1,1 @@
-web: python main.py
+web: python all_in_one.py
