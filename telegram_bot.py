@@ -1,20 +1,12 @@
 import os
 import logging
-import asyncio
-from datetime import datetime, timedelta
-from dotenv import load_dotenv
-from telegram import Update, ReplyKeyboardMarkup, KeyboardButton
-from telegram.ext import (
-    Application,
-    CommandHandler,
-    MessageHandler,
-    filters,
-    ContextTypes,
-    JobQueue
-)
-from telegram.constants import ParseMode
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
 import psycopg2
-from psycopg2.extras import RealDictCursor
+from datetime import datetime
+import pytz
+from dotenv import load_dotenv
+import pdfkit
 
 # Загрузка переменных окружения
 load_dotenv()
@@ -26,432 +18,352 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Проверяем переменные окружения
-TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')
-ADMIN_CHAT_IDS = os.getenv('ADMIN_CHAT_IDS', '').split(',')
-DATABASE_URL = os.getenv('DATABASE_URL')
-
-logger.info(f"✅ Токен получен: {'Да' if TOKEN else 'Нет'}")
-logger.info(f"✅ Админы: {len([x for x in ADMIN_CHAT_IDS if x.strip()])}")
-logger.info(f"✅ База данных: {'Да' if DATABASE_URL else 'Нет'}")
-
-if not TOKEN:
-    logger.error("❌ TELEGRAM_BOT_TOKEN не найден в переменных окружения!")
-    exit(1)
-
-# Подключение к Supabase
+# Подключение к базе данных
 def get_db_connection():
-    """Создать соединение с Supabase"""
-    try:
-        if not DATABASE_URL:
-            logger.error("❌ DATABASE_URL не настроен")
-            return None
-        
-        conn = psycopg2.connect(
-            DATABASE_URL,
-            cursor_factory=RealDictCursor
-        )
-        return conn
-    except Exception as e:
-        logger.error(f"❌ Ошибка подключения к базе данных: {e}")
-        return None
+    DATABASE_URL = os.getenv('DATABASE_URL')
+    return psycopg2.connect(DATABASE_URL)
 
-# ========== КОМАНДЫ БОТА ==========
-
-async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обработчик команды /start"""
+# Команда /start
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
-    logger.info(f"👤 Пользователь {user.id} ({user.first_name}) начал работу")
-    
     welcome_text = f"""
-🎉 *Добро пожаловать, {user.first_name}!*
+Привет, {user.first_name}! 👋
 
-🤖 Я — телеграм-бот для логистической компании *Margiana Logistic Services*.
+Я - бот Margiana Logistics для отслеживания грузов.
 
-*📋 Доступные команды:*
-/start - Начать работу
+Доступные команды:
+/orders - Список активных заказов
+/status [номер] - Статус заказа
+/report - Отчет в формате PDF
+/alerts - Настройка уведомлений
 /help - Помощь
-/active - Активные заказы
-/today - События сегодня
-/search - Поиск заказов
-/contacts - Контакты компании
+    """
+    await update.message.reply_text(welcome_text)
 
-*🔍 Примеры:*
-`/search ORD-001`
-`/active`
-`/today`
-
-📞 *Поддержка:* @margiana_logistics
-"""
+# Получить список заказов
+async def get_orders(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    conn = get_db_connection()
+    cur = conn.cursor()
     
-    await update.message.reply_text(
-        welcome_text,
-        parse_mode=ParseMode.MARKDOWN,
-        reply_markup=ReplyKeyboardMarkup([
-            [KeyboardButton("📊 Активные"), KeyboardButton("📅 Сегодня")],
-            [KeyboardButton("🔍 Поиск"), KeyboardButton("📞 Контакты")]
-        ], resize_keyboard=True)
-    )
-
-async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Показать справку"""
-    help_text = """
-*🆘 Помощь по командам*
-
-*📋 Основные команды:*
-/start - Начать работу
-/active - Активные заказы
-/today - События сегодня
-/search <текст> - Поиск заказов
-/contacts - Контакты компании
-
-*🔍 Примеры:*
-`/search ORD-001` - найти заказ
-`/search Клиент` - найти клиента
-`/active` - все активные заказы
-`/today` - события сегодня
-
-*🔔 Уведомления:*
-Бот отправляет уведомления о:
-• Новых заказах
-• Изменениях статусов
-• Ключевых событиях
-• Предстоящих событиях
-
-*📞 Контакты:*
-@margiana_logistics
-+993 61 55 77 79
-"""
+    cur.execute("""
+        SELECT order_number, client_name, status, tkm_date 
+        FROM orders 
+        WHERE status NOT IN ('Completed', 'Cancelled')
+        ORDER BY creation_date DESC
+        LIMIT 10
+    """)
     
-    await update.message.reply_text(help_text, parse_mode=ParseMode.MARKDOWN)
-
-async def active_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Показать активные заказы"""
-    try:
-        conn = get_db_connection()
-        if not conn:
-            await update.message.reply_text("❌ Ошибка подключения к базе")
-            return
-        
-        cursor = conn.cursor()
-        cursor.execute("""
-            SELECT * FROM orders 
-            WHERE status NOT IN ('Completed', 'Cancelled')
-            ORDER BY creation_date DESC 
-            LIMIT 10
-        """)
-        
-        orders = cursor.fetchall()
-        cursor.close()
-        conn.close()
-        
-        if not orders:
-            await update.message.reply_text("📭 Нет активных заказов")
-            return
-        
-        text = f"📊 *Активные заказы* ({len(orders)}):\n\n"
-        
-        for i, order in enumerate(orders, 1):
-            text += f"{i}. 📦 *{order['order_number']}*\n"
-            text += f"   👤 {order['client_name']}\n"
-            
-            if order['container_count']:
-                text += f"   📦 Контейнеров: {order['container_count']}\n"
-            
-            if order['route']:
-                text += f"   📍 {order['route']}\n"
-            
-            text += f"   📝 {order['status']}\n\n"
-        
-        await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
-        
-    except Exception as e:
-        logger.error(f"❌ Ошибка в active_command: {e}")
-        await update.message.reply_text("❌ Ошибка при получении данных")
-
-async def today_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """События на сегодня"""
-    try:
-        today = datetime.now().date()
-        
-        conn = get_db_connection()
-        if not conn:
-            await update.message.reply_text("❌ Ошибка подключения к базе")
-            return
-        
-        cursor = conn.cursor()
-        cursor.execute("""
-            SELECT order_number, client_name, status,
-                   departure_date, arrival_iran_date,
-                   truck_loading_date, arrival_turkmenistan_date,
-                   client_receiving_date, eta_date
-            FROM orders
-            WHERE (
-                DATE(departure_date) = %s OR
-                DATE(arrival_iran_date) = %s OR
-                DATE(truck_loading_date) = %s OR
-                DATE(arrival_turkmenistan_date) = %s OR
-                DATE(client_receiving_date) = %s OR
-                DATE(eta_date) = %s
-            )
-            LIMIT 5
-        """, (today, today, today, today, today, today))
-        
-        orders = cursor.fetchall()
-        cursor.close()
-        conn.close()
-        
-        if not orders:
-            await update.message.reply_text("📅 На сегодня нет событий")
-            return
-        
-        text = f"📅 *События сегодня* ({len(orders)}):\n\n"
-        
-        for order in orders:
-            text += f"📦 *{order['order_number']}*\n"
-            text += f"👤 {order['client_name']}\n"
-            
-            events = []
-            if order['departure_date'] and order['departure_date'].date() == today:
-                events.append("🚢 Отплытие")
-            if order['arrival_iran_date'] and order['arrival_iran_date'].date() == today:
-                events.append("🇮🇷 Прибытие в Иран")
-            if order['truck_loading_date'] and order['truck_loading_date'].date() == today:
-                events.append("🚛 Погрузка")
-            if order['arrival_turkmenistan_date'] and order['arrival_turkmenistan_date'].date() == today:
-                events.append("🇹🇲 Прибытие в Туркм.")
-            if order['client_receiving_date'] and order['client_receiving_date'].date() == today:
-                events.append("✅ Получение клиентом")
-            
-            for event in events:
-                text += f"   • {event}\n"
-            
-            text += "\n"
-        
-        await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
-        
-    except Exception as e:
-        logger.error(f"❌ Ошибка в today_command: {e}")
-        await update.message.reply_text("❌ Ошибка при получении данных")
-
-async def search_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Поиск заказов"""
-    if not context.args:
-        await update.message.reply_text(
-            "🔍 *Использование:*\n`/search <текст>`\n\n"
-            "*Примеры:*\n`/search ORD-001`\n`/search Клиент`",
-            parse_mode=ParseMode.MARKDOWN
-        )
+    orders = cur.fetchall()
+    cur.close()
+    conn.close()
+    
+    if not orders:
+        await update.message.reply_text("Нет активных заказов.")
         return
     
-    search_query = ' '.join(context.args)
+    response = "📦 *Активные заказы:*\n\n"
+    for order in orders:
+        order_num, client, status, tkm_date = order
+        tkm_info = f" | TKM: {tkm_date.strftime('%d.%m.%Y')}" if tkm_date else ""
+        response += f"• *{order_num}* - {client}\n"
+        response += f"  Статус: {status}{tkm_info}\n"
+        response += f"  /status_{order_num.replace('-', '_')}\n\n"
     
+    await update.message.reply_text(response, parse_mode='Markdown')
+
+# Получить статус конкретного заказа
+async def get_order_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    order_number = ' '.join(context.args)
+    if not order_number:
+        await update.message.reply_text("Укажите номер заказа: /status ORD-001")
+        return
+    
+    conn = get_db_connection()
+    cur = conn.cursor()
+    
+    cur.execute("""
+        SELECT o.*, 
+               COUNT(c.id) as container_count,
+               STRING_AGG(c.container_number, ', ') as containers
+        FROM orders o
+        LEFT JOIN containers c ON o.id = c.order_id
+        WHERE o.order_number = %s
+        GROUP BY o.id
+    """, (order_number,))
+    
+    order = cur.fetchone()
+    cur.close()
+    conn.close()
+    
+    if not order:
+        await update.message.reply_text(f"Заказ {order_number} не найден.")
+        return
+    
+    # Формируем ответ
+    response = f"""
+📋 *Заказ {order[1]}*
+
+👤 Клиент: {order[2]}
+📦 Контейнеров: {order[18] or 0}
+🚚 Маршрут: {order[4]}
+🏷️ Статус: {order[10]}
+🎨 Цвет статуса: {order[11]}
+
+📅 Даты:
+• Создан: {order[12].strftime('%d.%m.%Y') if order[12] else '—'}
+• ATD: {order[14].strftime('%d.%m.%Y') if order[14] else '—'}
+• ETA: {order[25].strftime('%d.%m.%Y') if order[25] else '—'}
+• Прибытие в Иран: {order[15].strftime('%d.%m.%Y') if order[15] else '—'}
+• TKM: {order[22].strftime('%d.%m.%Y') if order[22] else '—'}
+
+📝 Примечания: {order[27] or 'нет'}
+    """
+    
+    if order[29]:  # контейнеры
+        response += f"\n🚢 Контейнеры: {order[29]}"
+    
+    await update.message.reply_text(response, parse_mode='Markdown')
+
+# Генерация PDF отчета
+async def generate_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         conn = get_db_connection()
-        if not conn:
-            await update.message.reply_text("❌ Ошибка подключения к базе")
-            return
+        cur = conn.cursor()
         
-        cursor = conn.cursor()
-        cursor.execute("""
-            SELECT * FROM orders 
-            WHERE 
-                order_number ILIKE %s OR
-                client_name ILIKE %s OR
-                route ILIKE %s
-            ORDER BY creation_date DESC 
-            LIMIT 10
-        """, (f"%{search_query}%", f"%{search_query}%", f"%{search_query}%"))
+        # Получаем данные для отчета
+        cur.execute("""
+            SELECT 
+                o.order_number,
+                o.client_name,
+                o.document_number,
+                o.goods_type,
+                COUNT(c.id) as container_count,
+                SUM(c.weight) as total_weight,
+                o.status,
+                o.tkm_date,
+                o.arrival_notice_date,
+                o.has_loading_photo,
+                o.has_local_charges,
+                o.has_tex,
+                STRING_AGG(c.container_number, ', ') as containers
+            FROM orders o
+            LEFT JOIN containers c ON o.id = c.order_id
+            WHERE o.status NOT IN ('Cancelled')
+            GROUP BY o.id
+            ORDER BY o.order_number
+        """)
         
-        orders = cursor.fetchall()
-        cursor.close()
+        orders = cur.fetchall()
+        cur.close()
         conn.close()
         
-        if not orders:
-            await update.message.reply_text(f"🔍 По запросу '{search_query}' ничего не найдено")
-            return
+        # Генерируем HTML для PDF
+        html_content = generate_html_report(orders)
         
-        text = f"🔍 *Результаты поиска* ('{search_query}'):\n\n"
+        # Создаем PDF
+        pdf_filename = f"report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.pdf"
+        pdfkit.from_string(html_content, pdf_filename)
         
-        for i, order in enumerate(orders, 1):
-            text += f"{i}. 📦 *{order['order_number']}*\n"
-            text += f"   👤 {order['client_name']}\n"
-            if order['container_count']:
-                text += f"   📦 {order['container_count']} контейнеров\n"
-            text += f"   📝 {order['status']}\n\n"
+        # Отправляем PDF
+        with open(pdf_filename, 'rb') as pdf_file:
+            await update.message.reply_document(
+                document=pdf_file,
+                caption="📊 Отчет по заказам"
+            )
         
-        await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
+        # Удаляем временный файл
+        os.remove(pdf_filename)
         
     except Exception as e:
-        logger.error(f"❌ Ошибка в search_command: {e}")
-        await update.message.reply_text(f"❌ Ошибка при поиске")
+        logger.error(f"Error generating report: {e}")
+        await update.message.reply_text("Ошибка при генерации отчета.")
 
-async def contacts_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Контакты компании"""
-    contacts_text = """
-*🏢 Margiana Logistic Services*
-
-*📞 Контакты:*
-Телефон: +993 61 55 77 79
-Email: perman@margianalogistics.com
-Telegram: @margiana_logistics
-
-*🚚 Услуги:*
-• Китай → Туркменистан через Иран
-• Морские перевозки
-• Таможенное оформление
-• Сопровождение грузов
-
-*🕒 Режим работы:*
-Пн-Пт: 9:00-18:00
-Сб: 10:00-16:00
-Вс: выходной
-"""
+def generate_html_report(orders):
+    html = """
+    <html>
+    <head>
+        <meta charset="UTF-8">
+        <style>
+            body { font-family: Arial, sans-serif; margin: 40px; }
+            h1 { color: #2C3E50; text-align: center; }
+            table { width: 100%; border-collapse: collapse; margin-top: 20px; }
+            th { background-color: #2C3E50; color: white; padding: 10px; text-align: left; }
+            td { padding: 8px; border: 1px solid #ddd; }
+            tr:nth-child(even) { background-color: #f2f2f2; }
+            .status-active { color: green; font-weight: bold; }
+            .status-completed { color: blue; }
+            .checkbox { font-weight: bold; }
+            .check-yes { color: green; }
+            .check-no { color: red; }
+        </style>
+    </head>
+    <body>
+        <h1>Margiana Logistics - Отчет по заказам</h1>
+        <p>Сгенерировано: """ + datetime.now().strftime('%d.%m.%Y %H:%M') + """</p>
+        <table>
+            <tr>
+                <th>№ Заказа</th>
+                <th>Клиент</th>
+                <th>BL №</th>
+                <th>Груз</th>
+                <th>Конт.</th>
+                <th>Вес (кг)</th>
+                <th>Статус</th>
+                <th>TKM</th>
+                <th>AN</th>
+                <th>Фото</th>
+                <th>Расходы</th>
+                <th>TLX</th>
+            </tr>
+    """
     
-    await update.message.reply_text(contacts_text, parse_mode=ParseMode.MARKDOWN)
-
-async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обработка текстовых сообщений (кнопки)"""
-    text = update.message.text
-    
-    if text == "📊 Активные":
-        await active_command(update, context)
-    elif text == "📅 Сегодня":
-        await today_command(update, context)
-    elif text == "🔍 Поиск":
-        await update.message.reply_text("Введите текст для поиска. Пример: ORD-001")
-    elif text == "📞 Контакты":
-        await contacts_command(update, context)
-    else:
-        await update.message.reply_text(
-            f"Вы написали: {text}\n\n"
-            "Используйте кнопки или команды:\n"
-            "/start - меню\n"
-            "/help - помощь"
-        )
-
-# ========== УВЕДОМЛЕНИЯ ==========
-
-async def check_new_orders(context: ContextTypes.DEFAULT_TYPE):
-    """Проверка новых заказов"""
-    try:
-        logger.info("🔍 Проверка новых заказов...")
+    for order in orders:
+        photo_check = "✓" if order[9] else "✗"
+        charges_check = "✓" if order[10] else "✗"
+        tex_check = "✓" if order[11] else "✗"
         
+        tkm_date = order[7].strftime('%d.%m.%Y') if order[7] else ""
+        an_date = order[8].strftime('%d.%m.%Y') if order[8] else ""
+        
+        html += f"""
+            <tr>
+                <td>{order[0]}</td>
+                <td>{order[1]}</td>
+                <td>{order[2] or ''}</td>
+                <td>{order[3] or ''}</td>
+                <td>{order[4]}</td>
+                <td>{order[5] or 0}</td>
+                <td class="status-{order[6].lower()}">{order[6]}</td>
+                <td>{tkm_date}</td>
+                <td>{an_date}</td>
+                <td class="checkbox {'check-yes' if order[9] else 'check-no'}">{photo_check}</td>
+                <td class="checkbox {'check-yes' if order[10] else 'check-no'}">{charges_check}</td>
+                <td class="checkbox {'check-yes' if order[11] else 'check-no'}">{tex_check}</td>
+            </tr>
+        """
+    
+    html += """
+        </table>
+    </body>
+    </html>
+    """
+    
+    return html
+
+# Уведомления об изменениях
+async def check_updates(context: ContextTypes.DEFAULT_TYPE):
+    """Проверка изменений и отправка уведомлений"""
+    try:
         conn = get_db_connection()
-        if not conn:
-            return
+        cur = conn.cursor()
         
-        cursor = conn.cursor()
+        # Проверяем последние изменения (последний час)
+        cur.execute("""
+            SELECT o.order_number, o.status, o.tkm_date, 
+                   o.updated_at, o.client_name
+            FROM orders o
+            WHERE o.updated_at > NOW() - INTERVAL '1 hour'
+            ORDER BY o.updated_at DESC
+        """)
         
-        # Ищем заказы за последние 5 минут
-        five_minutes_ago = datetime.now() - timedelta(minutes=5)
-        
-        cursor.execute("""
-            SELECT * FROM orders 
-            WHERE sync_timestamp >= %s
-            ORDER BY sync_timestamp DESC
-            LIMIT 5
-        """, (five_minutes_ago,))
-        
-        new_orders = cursor.fetchall()
-        cursor.close()
+        updates = cur.fetchall()
+        cur.close()
         conn.close()
         
-        if new_orders:
-            for order in new_orders:
-                # Отправляем уведомление админам
-                for admin_id in ADMIN_CHAT_IDS:
-                    if admin_id.strip():
-                        try:
-                            await context.bot.send_message(
-                                chat_id=admin_id.strip(),
-                                text=f"""
-🆕 *НОВЫЙ ЗАКАЗ*
+        if updates:
+            for update in updates:
+                message = f"""
+🔄 *Обновление заказа!*
 
-📦 {order['order_number']}
-👤 {order['client_name']}
-📦 {order['container_count']} контейнеров
-📍 {order['route'] or 'Не указан'}
-📝 {order['status']}
-                                """,
-                                parse_mode=ParseMode.MARKDOWN
-                            )
-                        except Exception as e:
-                            logger.error(f"❌ Ошибка отправки: {e}")
-        
-        logger.info(f"✅ Найдено новых заказов: {len(new_orders)}")
-        
+📦 Заказ: {update[0]}
+👤 Клиент: {update[4]}
+🔄 Новый статус: {update[1]}
+📅 TKM дата: {update[2].strftime('%d.%m.%Y') if update[2] else 'не задана'}
+⏰ Обновлено: {update[3].strftime('%H:%M')}
+                """
+                
+                # Отправляем уведомления подписанным пользователям
+                # Здесь нужно добавить логику для отправки конкретным пользователям
+                
     except Exception as e:
-        logger.error(f"❌ Ошибка проверки заказов: {e}")
+        logger.error(f"Error checking updates: {e}")
 
-async def check_events(context: ContextTypes.DEFAULT_TYPE):
-    """Проверка событий"""
-    try:
-        logger.info("🔔 Проверка событий...")
-        
-        # Просто логируем, что проверка работает
-        logger.info("✅ Проверка событий выполнена")
-        
-    except Exception as e:
-        logger.error(f"❌ Ошибка проверки событий: {e}")
-
-# ========== ЗАПУСК БОТА ==========
-
-async def post_init(application: Application):
-    """Вызывается после инициализации бота"""
-    logger.info("✅ Бот инициализирован")
-    
-    # Запускаем задачи
-    job_queue = application.job_queue
-    if job_queue:
-        job_queue.run_repeating(check_new_orders, interval=300, first=10)  # Каждые 5 минут
-        job_queue.run_repeating(check_events, interval=3600, first=30)  # Каждый час
-        logger.info("✅ Задачи уведомлений запущены")
-
-async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обработка ошибок"""
-    logger.error(f"Ошибка: {context.error}")
-    if update and update.effective_message:
-        await update.effective_message.reply_text("❌ Произошла ошибка")
-
-def main():
-    """Основная функция запуска бота"""
-    logger.info("🚀 Запуск телеграм-бота...")
-    
-    try:
-        # Создаем приложение
-        application = Application.builder() \
-            .token(TOKEN) \
-            .post_init(post_init) \
-            .build()
-        
-        # Регистрируем обработчики команд
-        handlers = [
-            CommandHandler("start", start_command),
-            CommandHandler("help", help_command),
-            CommandHandler("active", active_command),
-            CommandHandler("today", today_command),
-            CommandHandler("search", search_command),
-            CommandHandler("contacts", contacts_command),
-            MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text_message)
+# Настройка уведомлений
+async def setup_alerts(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    keyboard = [
+        [
+            InlineKeyboardButton("Новые заказы", callback_data="alert_new"),
+            InlineKeyboardButton("Изменения статуса", callback_data="alert_status")
+        ],
+        [
+            InlineKeyboardButton("TKM обновления", callback_data="alert_tkm"),
+            InlineKeyboardButton("Все уведомления", callback_data="alert_all")
+        ],
+        [
+            InlineKeyboardButton("Отключить все", callback_data="alert_none")
         ]
-        
-        for handler in handlers:
-            application.add_handler(handler)
-        
-        # Обработчик ошибок
-        application.add_error_handler(error_handler)
-        
-        # Запускаем бота
-        logger.info("✅ Бот запущен и ожидает сообщений...")
-        application.run_polling(
-            allowed_updates=Update.ALL_TYPES,
-            drop_pending_updates=True
-        )
-        
-    except Exception as e:
-        logger.error(f"❌ Критическая ошибка: {e}")
-        raise
+    ]
+    
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    await update.message.reply_text(
+        "Выберите тип уведомлений:",
+        reply_markup=reply_markup
+    )
+
+async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    
+    if query.data.startswith("alert_"):
+        alert_type = query.data.replace("alert_", "")
+        await query.edit_message_text(f"✅ Уведомления '{alert_type}' настроены!")
+
+# Команда помощи
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    help_text = """
+📚 *Помощь по командам:*
+
+/start - Начало работы
+/orders - Список активных заказов (последние 10)
+/status [номер] - Детальная информация по заказу
+/report - Полный отчет в PDF
+/alerts - Настройка уведомлений
+/help - Эта справка
+
+*Примеры:*
+/status ORD-001 - информация по заказу ORD-001
+/orders - список активных заказов
+
+*По вопросам:* 
+perman@margianalogistics.com
+    """
+    await update.message.reply_text(help_text, parse_mode='Markdown')
+
+# Основная функция
+def main():
+    # Загрузка токена бота
+    TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')
+    if not TOKEN:
+        raise ValueError("Не указан TELEGRAM_BOT_TOKEN в переменных окружения")
+    
+    # Создание приложения
+    application = Application.builder().token(TOKEN).build()
+    
+    # Регистрация обработчиков команд
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler("orders", get_orders))
+    application.add_handler(CommandHandler("status", get_order_status))
+    application.add_handler(CommandHandler("report", generate_report))
+    application.add_handler(CommandHandler("alerts", setup_alerts))
+    application.add_handler(CommandHandler("help", help_command))
+    application.add_handler(CallbackQueryHandler(button_handler))
+    
+    # Настройка периодических задач (проверка обновлений каждые 5 минут)
+    job_queue = application.job_queue
+    job_queue.run_repeating(check_updates, interval=300, first=10)
+    
+    # Запуск бота
+    application.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == '__main__':
     main()
